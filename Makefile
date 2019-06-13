@@ -13,7 +13,7 @@ GOBUILD_LDFLAGS ?= \
 .PHONY: test clean deps build release
 
 test:
-	go vet && go test -v -race
+	go test -v -race
 
 deps:
 	go get -x -ldflags "$(GOBUILD_LDFLAGS)"
