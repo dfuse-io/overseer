@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"runtime"
 
 	"github.com/ShinyTrinkets/overseer.go"
 	log "github.com/azer/logger"
@@ -26,12 +27,22 @@ const (
 	descrip = "(<>..<>)"
 )
 
+var (
+	CommitHash string // injected by go build
+	BuildTime  string
+)
+
 func main() {
 	overseer.SetupLogBuilder(func(name string) overseer.Logger {
 		return log.New(name)
 	})
 
 	app := cli.App(name, descrip)
+
+	ver := (name + " " + descrip + "\n" + runtime.GOOS + " " + runtime.GOARCH +
+		"\n\n◇ Revision: " + CommitHash + "\n◇ Compiled: " + BuildTime)
+	app.Version("v version", ver)
+
 	app.Command("start", "Run Overseer", cmdRunAll)
 	app.Run(os.Args)
 }
