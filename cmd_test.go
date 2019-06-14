@@ -28,7 +28,7 @@ func TestCmdClone(t *testing.T) {
 	}
 
 	c1 := cmd.NewCmd("ls", []string{}, opt)
-	c2 := c1.CloneCmd()
+	c2 := c1.Clone()
 
 	if diffs := deep.Equal(c1.Group, c2.Group); diffs != nil {
 		t.Error(diffs)
