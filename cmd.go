@@ -567,7 +567,7 @@ func (rw *OutputBuffer) Lines() []string {
 
 // --------------------------------------------------------------------------
 
-const (
+var (
 	// DEFAULT_LINE_BUFFER_SIZE is the default size of the OutputStream line buffer.
 	// The default value is usually sufficient, but if ErrLineBufferOverflow errors
 	// occur, try increasing the size by calling OutputBuffer.SetLineBufferSize.
