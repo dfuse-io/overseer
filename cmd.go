@@ -465,7 +465,7 @@ func (c *Cmd) run() {
 			// exit code and determine if the process was signaled, which yields
 			// a more specific error message, so we set err again in that case.
 			exiterr := err.(*exec.ExitError)
-			err = nil
+			// err = nil
 			if waitStatus, ok := exiterr.Sys().(syscall.WaitStatus); ok {
 				exitCode = waitStatus.ExitStatus() // -1 if signaled
 				if waitStatus.Signaled() {
