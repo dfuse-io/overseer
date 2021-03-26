@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -28,6 +29,8 @@ func TestMain(m *testing.M) {
 }
 
 func TestOverseerBasic(t *testing.T) {
+	// The most basic Overseer test,
+	// check that Add returns a Cmd
 	assert := assert.New(t)
 	ovr := cmd.NewOverseer()
 
@@ -37,7 +40,7 @@ func TestOverseerBasic(t *testing.T) {
 	time.Sleep(timeUnit)
 
 	stat := ovr.Status(id)
-	assert.Equal(0, stat.Exit)
+	assert.Zero(stat.ExitCode)
 	assert.True(stat.PID > 0)
 
 	id = "list"
@@ -47,17 +50,30 @@ func TestOverseerBasic(t *testing.T) {
 	time.Sleep(timeUnit)
 
 	stat = ovr.Status(id)
-	assert.Equal(0, stat.Exit)
+	assert.Zero(stat.ExitCode)
 	assert.True(stat.PID > 0)
 
 	assert.Equal(2, len(ovr.ListAll()), "Expected 2 procs: echo, list")
 	assert.Equal(2, len(ovr.ListGroup("")), "Expected 2 procs: echo, list")
 
 	// Should not crash
-	ovr.StopAll()
+	ovr.StopAll(false)
+	ovr.StopAll(true)
+}
+
+func TestOverseerNegative(t *testing.T) {
+	// Negative testing. Try functions with wrong params.
+	assert := assert.New(t)
+	ovr := cmd.NewOverseer()
+
+	assert.False(ovr.Remove("x"))
+	assert.NotNil(ovr.Stop("x"))
+	assert.NotNil(ovr.Signal("x", syscall.SIGINT))
+	assert.Equal(ovr.Supervise("x"), -1)
 }
 
 func TestOverseerOptions(t *testing.T) {
+	// Test all possible options when adding a proc
 	assert := assert.New(t)
 	ovr := cmd.NewOverseer()
 
@@ -78,12 +94,13 @@ func TestOverseerOptions(t *testing.T) {
 }
 
 func TestOverseerAddRemove(t *testing.T) {
+	// Test adding and removing
 	assert := assert.New(t)
 	ovr := cmd.NewOverseer()
 
 	rng := make([]int, 10)
 	for nr := range rng {
-		assert.Equal(0, len(ovr.ListAll()))
+		assert.Zero(len(ovr.ListAll()))
 
 		nr := strconv.Itoa(nr)
 		id := fmt.Sprintf("id%s", nr)
@@ -96,7 +113,7 @@ func TestOverseerAddRemove(t *testing.T) {
 		assert.Equal(1, len(ovr.ListAll()))
 
 		assert.True(ovr.Remove(id))
-		assert.Equal(0, len(ovr.ListAll()))
+		assert.Zero(len(ovr.ListAll()))
 	}
 }
 
@@ -105,11 +122,11 @@ func TestOverseerSignalStop(t *testing.T) {
 	ovr := cmd.NewOverseer()
 
 	id := "ping"
-	opts := cmd.Options{Buffered: false, Streaming: false, DelayStart: 1}
+	opts := cmd.Options{DelayStart: 0}
 	ovr.Add(id, "ping", []string{"localhost"}, opts)
 
-	json := ovr.ToJSON(id)
-	assert.Equal("initial", json.State)
+	stat := ovr.Status(id)
+	assert.Equal("initial", stat.State)
 
 	assert.Nil(ovr.Stop(id))
 	assert.Nil(ovr.Stop(id))
@@ -117,13 +134,26 @@ func TestOverseerSignalStop(t *testing.T) {
 	assert.Nil(ovr.Signal(id, syscall.SIGTERM))
 	assert.Nil(ovr.Signal(id, syscall.SIGINT))
 
-	json = ovr.ToJSON(id)
-	assert.Equal("initial", json.State)
+	stat = ovr.Status(id)
+	assert.Equal("initial", stat.State)
 
 	assert.Equal(1, len(ovr.ListAll()))
+
+	go ovr.Supervise(id)
+	time.Sleep(timeUnit)
+	assert.Nil(ovr.Signal(id, syscall.SIGINT))
+
+	go ovr.Supervise(id)
+	time.Sleep(timeUnit)
+	assert.Nil(ovr.Signal(id, syscall.SIGTERM))
+
+	go ovr.Supervise(id)
+	time.Sleep(timeUnit)
+	assert.Nil(ovr.Stop(id))
 }
 
 func TestOverseerSupervise(t *testing.T) {
+	// Test single Supervise
 	assert := assert.New(t)
 	ovr := cmd.NewOverseer()
 
@@ -137,53 +167,117 @@ func TestOverseerSupervise(t *testing.T) {
 	ovr.Supervise(id) // To supervise sleep. How cool is that?
 
 	stat := ovr.Status(id)
-	assert.Equal(stat.Exit, 0, "Exit code should be 0")
+	assert.Equal(0, stat.ExitCode)
+	assert.Equal("finished", stat.State)
 	assert.Nil(stat.Error, "Error should be nil")
 
-	json := ovr.ToJSON(id)
-	assert.Equal("finished", json.State)
-
-	assert.Equal(2, len(ovr.ListAll()), "Expected 2 procs: echo, sleep")
+	assert.Equal([]string{"echo", "sleep"}, ovr.ListAll())
 }
 
-func TestOverseerSuperviseAll(t *testing.T) {
+func TestOverseerSignalStopRestart(t *testing.T) {
+	// Test stop in case of Rety > 1
+	// If the retry number is a positive number,
+	// the retry number is reset to 0 on cmd.Stop()
 	assert := assert.New(t)
 	ovr := cmd.NewOverseer()
 
-	id := "echo"
-	ovr.Add(id, "echo", []string{"x"})
+	id := "ping"
+	opts := cmd.Options{RetryTimes: 3}
+	ovr.Add(id, "ping", []string{"localhost"}, opts)
 
 	stat := ovr.Status(id)
-	assert.Equal(stat.Exit, -1, "Exit code should be -1")
-	assert.Equal(stat.PID, 0)
+	assert.Equal("initial", stat.State)
+
+	assert.Nil(ovr.Stop(id))
+	assert.Nil(ovr.Signal(id, syscall.SIGTERM))
+
+	go ovr.Supervise(id)
+	time.Sleep(timeUnit)
+
+	// Signal() doesn't reset retry times
+	assert.Nil(ovr.Signal(id, syscall.SIGTERM))
+	stat = ovr.Status(id)
+	assert.Equal("stopping", stat.State)
+
+	time.Sleep(timeUnit)
+	stat = ovr.Status(id)
+	assert.NotZero(stat.RetryTimes)
+	assert.Equal("running", stat.State)
+
+	// Stop() resets retry times
+	assert.Nil(ovr.Stop(id))
+	stat = ovr.Status(id)
+	assert.Equal("stopping", stat.State)
+
+	time.Sleep(timeUnit)
+	stat = ovr.Status(id)
+	assert.Zero(stat.RetryTimes)
+	assert.Equal("interrupted", stat.State)
+
+	ovr.StopAll(true)
+
+	time.Sleep(timeUnit)
+	stat = ovr.Status(id)
+	assert.Equal("interrupted", stat.State)
+}
+
+func TestOverseerSuperviseAll(t *testing.T) {
+	// Test Supervise all
+	// Overseer HANGS FOREVER in this test
+
+	assert := assert.New(t)
+	ovr := cmd.NewOverseer()
+
+	id := "sleep"
+	ovr.Add(id, "sleep", []string{"1"})
+
+	stat := ovr.Status(id)
+	assert.Equal(-1, stat.ExitCode)
+	assert.Equal(0, stat.PID)
 
 	id = "list"
 	ovr.Add(id, "ls", []string{"/usr/"})
 
-	// before supervise
-	assert.Equal(2, len(ovr.ListAll()), "Expected 2 procs")
-
 	stat = ovr.Status(id)
-	assert.Equal(-1, stat.Exit)
+	assert.Equal(-1, stat.ExitCode)
 	assert.Equal(0, stat.PID)
 
-	// block and wait for procs to finish
-	go ovr.SuperviseAll()
+	// list before supervise
+	assert.Equal([]string{"list", "sleep"}, ovr.ListAll())
+
+	// ch1 := make(chan *cmd.ProcessJSON)
+	// ovr.Watch(ch1)
+	// go func() {
+	// 	for state := range ch1 {
+	// 		fmt.Printf("> STATE CHANGED %v\n", state)
+	// 	}
+	// }()
+
+	ovr.SuperviseAll()
 	// next calls shouldn't do anything
-	ovr.SuperviseAll()
+	go ovr.SuperviseAll()
+	go ovr.SuperviseAll()
+	go ovr.SuperviseAll()
 	ovr.SuperviseAll()
 
-	time.Sleep(timeUnit * 4)
+	time.Sleep(time.Second + timeUnit*2)
 
-	// after supervise
-	assert.Equal(2, len(ovr.ListAll()), "Expected 2 procs")
+	// list after supervise
+	assert.Equal([]string{"list", "sleep"}, ovr.ListAll())
 
 	stat = ovr.Status(id)
-	assert.Equal(0, stat.Exit)
 	assert.NotEqual(0, stat.PID)
+	assert.Equal(0, stat.ExitCode)
+	assert.Equal("finished", stat.State)
+	pid1 := stat.PID
 
-	json := ovr.ToJSON(id)
-	assert.Equal("finished", json.State)
+	// check that SuperviseAll can be run again
+	ovr.SuperviseAll()
+
+	stat = ovr.Status(id)
+	pid2 := stat.PID
+
+	assert.NotEqual(pid1, pid2)
 }
 
 func TestOverseerSleep(t *testing.T) {
@@ -199,25 +293,59 @@ func TestOverseerSleep(t *testing.T) {
 	// can't remove while it's running
 	assert.False(ovr.Remove(id))
 
-	json := ovr.ToJSON(id)
+	stat := ovr.Status(id)
 	// JSON status should contain the same info
-	assert.Equal("running", json.State)
-	assert.Equal(-1, json.ExitCode)
-	assert.NotEqual(0, json.PID)
-	assert.Nil(json.Error)
+	assert.Equal("running", stat.State)
+	assert.Equal(-1, stat.ExitCode)
+	assert.NotEqual(0, stat.PID)
+	assert.Nil(stat.Error)
 
 	// success kill
 	assert.Nil(ovr.Signal(id, syscall.SIGKILL))
 	time.Sleep(timeUnit)
 
 	// proc was killed
-	json = ovr.ToJSON(id)
-	assert.Equal("interrupted", json.State)
-	assert.Equal(-1, json.ExitCode)
-	assert.NotNil(json.Error)
+	stat = ovr.Status(id)
+	assert.Equal("interrupted", stat.State)
+	assert.Equal(-1, stat.ExitCode)
+	assert.NotNil(stat.Error)
 
 	// can remove now
 	assert.True(ovr.Remove(id))
+}
+
+func TestOverseerWatchLogs(t *testing.T) {
+	assert := assert.New(t)
+	ovr := cmd.NewOverseer()
+
+	opts := cmd.Options{Buffered: false, Streaming: true}
+	ovr.Add("echo", "echo", []string{"ECHO!"}, opts)
+	ovr.Add("ping", "ping", []string{"127.0.0.1", "-c", "1"}, opts)
+
+	assert.Equal(2, len(ovr.ListAll()))
+
+	lg := make(chan *cmd.LogMsg)
+	ovr.WatchLogs(lg)
+
+	messages := ""
+	lock := &sync.Mutex{}
+	go func() {
+		for logMsg := range lg {
+			lock.Lock()
+			assert.NotEqual(2, logMsg.Type) // Will this work on all platforms?
+			messages += logMsg.Text
+			lock.Unlock()
+		}
+	}()
+
+	ovr.SuperviseAll()
+	time.Sleep(timeUnit * 4)
+
+	lock.Lock()
+	assert.True(strings.ContainsAny(messages, "ECHO!"))
+	assert.True(strings.ContainsAny(messages, "(127.0.0.1)"))
+	assert.True(strings.ContainsAny(messages, "ping statistics"))
+	lock.Unlock()
 }
 
 func TestOverseerInvalidProcs(t *testing.T) {
@@ -226,7 +354,6 @@ func TestOverseerInvalidProcs(t *testing.T) {
 
 	ch := make(chan *cmd.ProcessJSON)
 	ovr.Watch(ch)
-	// ovr.UnWatch(ch)
 
 	go func() {
 		for state := range ch {
@@ -243,15 +370,10 @@ func TestOverseerInvalidProcs(t *testing.T) {
 	ovr.Supervise(id)
 
 	stat := ovr.Status(id)
-	json := ovr.ToJSON(id)
 
-	assert.Equal(stat.Exit, -1, "Exit code should be negative")
+	assert.Equal(-1, stat.ExitCode, "Exit code should be negative")
 	assert.NotEqual(stat.Error, nil, "Error shouldn't be nil")
-	assert.Equal("fatal", json.State)
-	// JSON status should contain the same info
-	assert.Equal(stat.Exit, json.ExitCode)
-	assert.Equal(stat.Error, json.Error)
-	assert.Equal(stat.PID, json.PID)
+	assert.Equal("fatal", stat.State)
 
 	// try to stop a dead process
 	assert.Nil(ovr.Stop(id))
@@ -265,16 +387,17 @@ func TestOverseerInvalidProcs(t *testing.T) {
 	ovr.Supervise(id)
 
 	stat = ovr.Status(id)
-	json = ovr.ToJSON(id)
 
 	// LS returns a positive code when given a wrong path,
 	// but the execution of the command overall is a success
-	assert.True(stat.Exit > 0, "Exit code should be positive")
+	assert.True(stat.ExitCode > 0, "Exit code should be positive")
 	assert.Nil(stat.Error, "Error should be nil")
-	assert.Equal("finished", json.State)
+	assert.Equal("finished", stat.State)
 }
 
 func TestOverseerInvalidParams(t *testing.T) {
+	// The purpose of this test is to check that
+	// Overseer.Add rejects invalid params
 	assert := assert.New(t)
 	ovr := cmd.NewOverseer()
 
@@ -289,6 +412,8 @@ func TestOverseerInvalidParams(t *testing.T) {
 }
 
 func TestOverseerWatchUnwatch(t *testing.T) {
+	// The purpose of this test is to check that
+	// watch/ un-watch works as expected
 	assert := assert.New(t)
 	ovr := cmd.NewOverseer()
 
@@ -302,6 +427,7 @@ func TestOverseerWatchUnwatch(t *testing.T) {
 
 	ch1 := make(chan *cmd.ProcessJSON)
 	ovr.Watch(ch1)
+	// un-subscribe from events
 	ovr.UnWatch(ch1)
 
 	// CH2 will receive events
@@ -310,6 +436,7 @@ func TestOverseerWatchUnwatch(t *testing.T) {
 
 	ch3 := make(chan *cmd.ProcessJSON)
 	ovr.Watch(ch3)
+	// un-subscribe from events
 	ovr.UnWatch(ch3)
 
 	// CH4 will also receive events
@@ -339,8 +466,8 @@ func TestOverseerWatchUnwatch(t *testing.T) {
 	ovr.Add(id, "ls", []string{"-la"})
 	ovr.SuperviseAll()
 
-	json := ovr.ToJSON(id)
-	assert.Equal("finished", json.State)
+	stat := ovr.Status(id)
+	assert.Equal("finished", stat.State)
 
 	lock.Lock()
 	assert.Equal(6, results.Len())
@@ -355,47 +482,129 @@ func TestOverseerWatchUnwatch(t *testing.T) {
 	// }
 }
 
-func TestOverseersMany(t *testing.T) {
+func TestOverseersManyInstances(t *testing.T) {
+	// The purpose of this test is to check that
+	// multiple Overseer instances can be run concurently
+	// Also check that StopAll kills the processes
 	assert := assert.New(t)
+	opts := cmd.Options{
+		Group: "A", Dir: "/",
+		Buffered: false, Streaming: false,
+		DelayStart: 1, RetryTimes: 1,
+	}
 
-	rng := []int{10, 11, 12, 13, 14, 15}
+	rng := []int{10, 11, 12, 13, 14}
 	for _, nr := range rng {
 		ovr := cmd.NewOverseer()
 		assert.Equal(0, len(ovr.ListAll()))
 
 		nr := strconv.Itoa(nr)
 		id := fmt.Sprintf("id%s", nr)
-		opts := cmd.Options{
-			Group: "A", Dir: "/",
-			Buffered: false, Streaming: false,
-			DelayStart: 1, RetryTimes: 1,
-		}
-		ovr.Add(id, "sleep", []string{nr}, opts)
 
+		ovr.Add(id, "sleep", []string{nr}, opts)
 		assert.Equal(1, len(ovr.ListAll()))
 
 		go ovr.SuperviseAll()
 		time.Sleep(timeUnit * 2)
-		ovr.StopAll()
+		ovr.StopAll(false)
 		time.Sleep(timeUnit * 2)
+		ovr.StopAll(true)
 
-		json := ovr.ToJSON(id)
-		assert.Equal("interrupted", json.State)
+		stat := ovr.Status(id)
+		assert.Equal("interrupted", stat.State)
+		assert.NotEqual(0, stat.PID)
 	}
 }
 
 func TestOverseersExit1(t *testing.T) {
+	// The purpose of this test is to check the Overseer
+	// handles Exit Codes != 0
 	assert := assert.New(t)
-	ovr := cmd.NewOverseer()
+	options := []cmd.Options{
+		{DelayStart: 1, RetryTimes: 1, Buffered: true},
+		{DelayStart: 1, RetryTimes: 1, Streaming: true},
+	}
 
-	id := "bash1"
-	opts := cmd.Options{DelayStart: 1, RetryTimes: 1}
-	ovr.Add("bash1", "bash", opts, []string{"-c", "echo 'First'; sleep 1; exit 1"})
+	for _, opt := range options {
+		ovr := cmd.NewOverseer()
 
-	ovr.Supervise(id)
+		id := "bash1"
+		ovr.Add("bash1", "bash", opt, []string{"-c", "echo 'First'; sleep 1; exit 1"})
 
-	json := ovr.ToJSON(id)
-	assert.Equal(1, json.ExitCode)
-	assert.Equal(nil, json.Error)
-	assert.Equal("finished", json.State)
+		ovr.Supervise(id)
+
+		stat := ovr.Status(id)
+		assert.Equal(1, stat.ExitCode)
+		assert.Equal(nil, stat.Error)
+		assert.Equal("finished", stat.State)
+	}
+}
+
+func TestOverseerKillRestart(t *testing.T) {
+	// The purpose of this test is to check how Overseer
+	// handles several Supervise/ Stop of the same proc
+	assert := assert.New(t)
+	options := []cmd.Options{
+		{DelayStart: 100, RetryTimes: 1, Buffered: true},
+		{DelayStart: 100, RetryTimes: 1, Streaming: true},
+	}
+
+	for _, opt := range options {
+		ovr := cmd.NewOverseer()
+		id := "sleep1"
+		ovr.Add(id, "sleep", opt, []string{"10"})
+
+		stat := ovr.Status(id)
+		assert.Equal("initial", stat.State)
+		assert.Equal(-1, stat.ExitCode)
+		assert.Nil(stat.Error)
+
+		rng := []int{1, 2, 3}
+		for range rng {
+			go ovr.Supervise(id)
+			time.Sleep(timeUnit * 2)
+			assert.Nil(ovr.Stop(id))
+			time.Sleep(timeUnit * 2)
+
+			stat = ovr.Status(id)
+			assert.Equal("interrupted", stat.State)
+			assert.Equal(-1, stat.ExitCode)
+			assert.NotNil(stat.Error)
+		}
+	}
+}
+
+func TestOverseerFinishRestart(t *testing.T) {
+	// The purpose of this test is to check how Overseer
+	// handles several Supervise, finish, restart
+	assert := assert.New(t)
+	options := []cmd.Options{
+		{DelayStart: 1, Buffered: true},
+		{DelayStart: 1, Streaming: true},
+	}
+
+	for _, opt := range options {
+		ovr := cmd.NewOverseer()
+
+		id := "ls1"
+		ovr.Add(id, "ls", opt, []string{"-la"})
+
+		stat := ovr.Status(id)
+		assert.Equal("initial", stat.State)
+		assert.Equal(-1, stat.ExitCode)
+		assert.Nil(stat.Error)
+
+		rng := []int{1, 2, 3}
+		for range rng {
+			ovr.Supervise(id)
+			time.Sleep(timeUnit * 2)
+			assert.Nil(ovr.Stop(id))
+
+			stat = ovr.Status(id)
+			assert.Equal(0, stat.ExitCode)
+			assert.Equal(nil, stat.Error)
+			assert.Equal("finished", stat.State)
+		}
+		ovr.StopAll(false)
+	}
 }

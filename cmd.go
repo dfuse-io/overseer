@@ -16,8 +16,8 @@
 //   )
 //
 //   func main() {
-//       // Create Cmd, buffered output
-//       envCmd := cmd.NewCmd("env", cmd.Options{Buffered: true})
+//       // Create a Cmd
+//       envCmd := cmd.NewCmd("env")
 //
 //       // Run and wait for Cmd to return Status
 //       status := <-envCmd.Start()
@@ -52,6 +52,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -136,7 +137,7 @@ type Options struct {
 // The command is not started until Start is called.
 func NewCmd(name string, args ...interface{}) *Cmd {
 	var para []string
-	opts := Options{Buffered: false, Streaming: true}
+	var opts Options
 
 	for _, arg := range args {
 		switch arg.(type) {
@@ -182,7 +183,7 @@ func NewCmd(name string, args ...interface{}) *Cmd {
 	return c
 }
 
-// Clone clones a Cmd. All the configs are transferred,
+// Clone clones a Cmd. All the options are copied,
 // but the state of the original object is lost.
 func (c *Cmd) Clone() *Cmd {
 	clone := NewCmd(
@@ -226,10 +227,14 @@ func (c *Cmd) setState(state CmdState) {
 func (c *Cmd) IsInitialState() bool {
 	c.stateLock.Lock()
 	defer c.stateLock.Unlock()
-	if c.State == INITIAL {
-		return true
-	}
-	return false
+	return c.State == INITIAL
+}
+
+// IsRunningState returns true if the Cmd is starting, or running.
+func (c *Cmd) IsRunningState() bool {
+	c.stateLock.Lock()
+	defer c.stateLock.Unlock()
+	return c.State == STARTING || c.State == RUNNING
 }
 
 // IsFinalState returns true if the Cmd is in a final state.
@@ -241,6 +246,13 @@ func (c *Cmd) IsFinalState() bool {
 		return true
 	}
 	return false
+}
+
+// getRetryTimes ...
+func (c *Cmd) getRetryTimes() uint {
+	c.Lock()
+	defer c.Unlock()
+	return c.RetryTimes
 }
 
 // Start starts the command and immediately returns a channel that the caller
@@ -273,6 +285,7 @@ func (c *Cmd) Start() <-chan Status {
 }
 
 // Stop stops the command by sending its process group a SIGTERM signal.
+// Stop makes sure the command doesn't restart, by resetting the retry times.
 // Stop is idempotent. An error should only be returned in the rare case that
 // Stop is called immediately after the command ends but before Start can
 // update its internal state.
@@ -286,13 +299,16 @@ func (c *Cmd) Stop() error {
 		return nil
 	}
 
+	// Make sure the command doesn't restart
+	c.RetryTimes = 0
+
 	// Flag that command was stopped, it didn't complete.
 	c.setState(STOPPING)
 
 	// Signal the process group (-pid), not just the process, so that the process
 	// and all its children are signaled. Else, child procs can keep running and
 	// keep the stdout/stderr fd open and cause cmd.Wait to hang.
-	return syscall.Kill(-c.status.PID, syscall.SIGTERM)
+	return sendSignal(-c.status.PID, syscall.SIGTERM)
 }
 
 // Signal sends OS signal to the process group.
@@ -309,7 +325,23 @@ func (c *Cmd) Signal(sig syscall.Signal) error {
 	}
 
 	// Signal the process group (-pid)
-	return syscall.Kill(-c.status.PID, sig)
+	return sendSignal(-c.status.PID, sig)
+}
+
+func sendSignal(pid int, sig syscall.Signal) error {
+	proc, err := os.FindProcess(pid)
+
+	if err != nil {
+		return err
+	}
+
+	err = proc.Signal(sig)
+
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Status returns the Status of the command at any time. It is safe to call
@@ -348,10 +380,14 @@ func (c *Cmd) Status() Status {
 		}
 	} else {
 		// Still running
-		c.status.Runtime = time.Now().Sub(c.startTime).Seconds()
+		c.status.Runtime = time.Since(c.startTime).Seconds()
 		if c.buffered {
-			c.status.Stdout = c.stdout.Lines()
-			c.status.Stderr = c.stderr.Lines()
+			if c.stdout != nil {
+				c.status.Stdout = c.stdout.Lines()
+			}
+			if c.stderr != nil {
+				c.status.Stderr = c.stderr.Lines()
+			}
 		}
 	}
 
@@ -360,7 +396,7 @@ func (c *Cmd) Status() Status {
 
 // Done returns a channel that's closed when the command stops running.
 // This method is useful for multiple goroutines to wait for the command
-// to finish.Call Status after the command finishes to get its final status.
+// to finish. Call Status after the command finishes to get its final status.
 func (c *Cmd) Done() <-chan struct{} {
 	return c.doneChan
 }
@@ -386,7 +422,7 @@ func (c *Cmd) run() {
 	// Set process group ID so the cmd and all its children become a new
 	// process group. This allows Stop to SIGTERM the cmd's process group
 	// without killing this process (i.e. this code here).
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = setSysProcAttr()
 
 	// Write stdout and stderr to buffers that are safe to read while writing
 	// and don't cause a race condition.
@@ -398,10 +434,12 @@ func (c *Cmd) run() {
 		cmd.Stderr = io.MultiWriter(NewOutputStream(c.Stderr), c.stderr)
 	} else if c.buffered {
 		// Buffered only
+		c.Lock()
 		c.stdout = NewOutputBuffer()
 		c.stderr = NewOutputBuffer()
 		cmd.Stdout = c.stdout
 		cmd.Stderr = c.stderr
+		c.Unlock()
 	} else if c.Stdout != nil {
 		// Streaming only
 		cmd.Stdout = NewOutputStream(c.Stdout)
@@ -448,50 +486,40 @@ func (c *Cmd) run() {
 	// //////////////////////////////////////////////////////////////////////
 	err := cmd.Wait()
 	now = time.Now()
+	exitCode := 0
+
+	// Set final status
+	c.Lock()
+	defer c.Unlock()
 
 	// Get exit code of the command. According to the manual, Wait() returns:
 	// "If the command fails to run or doesn't complete successfully, the error
 	// is of type *ExitError. Other error types may be returned for I/O problems."
-	exitCode := 0
-	if err != nil {
-		switch err.(type) {
-		case *exec.ExitError:
-			// This is the normal case which is not really an error. It's string
-			// representation is only "*exec.ExitError". It only means the cmd
-			// did not exit zero and caller should see ExitError.Stderr, which
-			// we already have. So first we'll have this as the real/underlying
-			// type, then discard err so status.Error doesn't contain a useless
-			// "*exec.ExitError". With the real type we can get the non-zero
-			// exit code and determine if the process was signaled, which yields
-			// a more specific error message, so we set err again in that case.
-			exiterr := err.(*exec.ExitError)
-			// err = nil
-			if waitStatus, ok := exiterr.Sys().(syscall.WaitStatus); ok {
-				exitCode = waitStatus.ExitStatus() // -1 if signaled
-				if waitStatus.Signaled() {
-					c.Lock()
-					err = errors.New(exiterr.Error()) // "signal: terminated"
-					c.status.Runtime = now.Sub(c.startTime).Seconds()
-					c.status.StopTs = now.UnixNano()
-					c.status.Exit = exitCode
-					c.status.Error = err
-					c.setState(INTERRUPT)
-					c.Unlock()
-				}
+	if err != nil && fmt.Sprintf("%T", err) == "*exec.ExitError" {
+		// This is the normal case which is not really an error. It's string
+		// representation is only "*exec.ExitError". It only means the cmd
+		// did not exit zero and caller should see ExitError.Stderr, which
+		// we already have. So first we'll have this as the real/underlying
+		// type, then discard err so status.Error doesn't contain a useless
+		// "*exec.ExitError". With the real type we can get the non-zero
+		// exit code and determine if the process was signaled, which yields
+		// a more specific error message, so we set err again in that case.
+		exiterr := err.(*exec.ExitError)
+		// err = nil
+		if waitStatus, ok := exiterr.Sys().(syscall.WaitStatus); ok {
+			exitCode = waitStatus.ExitStatus() // -1 if signaled
+			if waitStatus.Signaled() {
+				err = errors.New(exiterr.Error()) // "signal: terminated"
+				c.setState(INTERRUPT)
 			}
-		default:
-			// I/O problem according to the manual ^. Don't change err.
 		}
 	}
 
-	// Set final status
-	c.Lock()
 	c.status.Runtime = now.Sub(c.startTime).Seconds()
 	c.status.StopTs = now.UnixNano()
 	c.status.Exit = exitCode
 	c.status.Error = err
 	c.setState(FINISHED)
-	c.Unlock()
 }
 
 // //////////////////////////////////////////////////////////////////////////
@@ -517,7 +545,7 @@ func (c *Cmd) run() {
 // a Go standard library os/exec.Command:
 //
 //   import "os/exec"
-//   import "github.com/go-cmd/cmd"
+//   import cmd "github.com/ShinyTrinkets/overseer"
 //   runnableCmd := exec.Command(...)
 //   stdout := cmd.NewOutputBuffer()
 //   runnableCmd.Stdout = stdout
@@ -609,7 +637,7 @@ func (e ErrLineBufferOverflow) Error() string {
 // OutputStream directly with a Go standard library os/exec.Command:
 //
 //   import "os/exec"
-//   import "github.com/go-cmd/cmd"
+//   import cmd "github.com/ShinyTrinkets/overseer"
 //
 //   stdoutChan := make(chan string, 100)
 //   go func() {
@@ -661,7 +689,6 @@ func (rw *OutputStream) Write(p []byte) (n int, err error) {
 	n = len(p) // end of buffer
 	firstChar := 0
 
-LINES:
 	for {
 		// Find next newline in stream buffer. nextLine starts at 0, but buff
 		// can contain multiple lines, like "foo\nbar". So in that case nextLine
@@ -669,7 +696,7 @@ LINES:
 		// will be 3 and 7, respectively. So lines are [0:3] are [4:7].
 		newlineOffset := bytes.IndexByte(p[firstChar:], '\n')
 		if newlineOffset < 0 {
-			break LINES // no newline in stream, next line incomplete
+			break // no newline in stream, next line incomplete
 		}
 
 		// End of line offset is start (nextLine) + newline offset. Like bufio.Scanner,
